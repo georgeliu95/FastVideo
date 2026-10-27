@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
 project(fastvideo-kernel LANGUAGES CXX)
 
+# torch >= 2.14 headers require C++20 (#error in torch/all.h); the extension's .cpp files take the default.
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 # Capture any caller-provided -DCMAKE_CUDA_ARCHITECTURES *before* enable_language(CUDA)
 # auto-populates it with CMake's built-in default (an old arch, e.g. sm_75 on CUDA 13).
 # torch's cmake actually ignores CMAKE_CUDA_ARCHITECTURES (it drives arch selection via
@@ -486,7 +490,7 @@ if(ENABLE_ATTN_QAT_INFER)
     )
     set(ATTN_QAT_INFER_CUDA_FLAGS
         "-O3"
-        "-std=c++17"
+        "-std=c++20"
         "-U__CUDA_NO_HALF_OPERATORS__"
         "-U__CUDA_NO_HALF_CONVERSIONS__"
         "-U__CUDA_NO_BFLOAT16_OPERATORS__"
@@ -512,13 +516,13 @@ if(ENABLE_ATTN_QAT_INFER)
     target_include_directories(fp4attn_cuda PRIVATE ${ATTN_QAT_INFER_INCLUDE_DIRS})
     target_compile_definitions(fp4attn_cuda PRIVATE TORCH_EXTENSION_NAME=fp4attn_cuda)
     target_compile_options(fp4attn_cuda PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:-O3 -std=c++17>
+        $<$<COMPILE_LANGUAGE:CXX>:-O3 -std=c++20>
         $<$<COMPILE_LANGUAGE:CUDA>:${ATTN_QAT_INFER_CUDA_FLAGS}>
     )
     set_target_properties(fp4attn_cuda PROPERTIES
         CUDA_ARCHITECTURES "120a"
-        CXX_STANDARD 17
-        CUDA_STANDARD 17
+        CXX_STANDARD 20
+        CUDA_STANDARD 20
     )
     target_link_libraries(fp4attn_cuda PRIVATE ${TORCH_LIBRARIES} CUDA::cudart CUDA::cuda_driver)
 
@@ -528,13 +532,13 @@ if(ENABLE_ATTN_QAT_INFER)
     target_include_directories(fp4quant_cuda PRIVATE ${ATTN_QAT_INFER_INCLUDE_DIRS})
     target_compile_definitions(fp4quant_cuda PRIVATE TORCH_EXTENSION_NAME=fp4quant_cuda)
     target_compile_options(fp4quant_cuda PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:-O3 -std=c++17>
+        $<$<COMPILE_LANGUAGE:CXX>:-O3 -std=c++20>
         $<$<COMPILE_LANGUAGE:CUDA>:${ATTN_QAT_INFER_CUDA_FLAGS}>
     )
     set_target_properties(fp4quant_cuda PROPERTIES
         CUDA_ARCHITECTURES "120a"
-        CXX_STANDARD 17
-        CUDA_STANDARD 17
+        CXX_STANDARD 20
+        CUDA_STANDARD 20
     )
     target_link_libraries(fp4quant_cuda PRIVATE ${TORCH_LIBRARIES} CUDA::cudart CUDA::cuda_driver)
 
