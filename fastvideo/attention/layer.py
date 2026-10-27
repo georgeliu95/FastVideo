@@ -266,11 +266,13 @@ class DistributedAttention_VSA(DistributedAttention):
         replicated_output = None
 
         # Apply backend-specific postprocess_output
-        output = self.attn_impl.postprocess_output(output, ctx_attn_metadata)
-
-        output = torch.nn.functional.pad(output, (0, 0, 0, 0, 0, pad_seq_len))
-
-        output = sequence_model_parallel_all_to_all_4D(output, scatter_dim=1, gather_dim=2)
+        if os.environ.get("SPARK_CP_H3_PACK", "0") == "1" and get_sp_world_size() > 1:
+            from runtime.stage1_ops.cp_transport import reverse_tiled_exchange
+            output = reverse_tiled_exchange(output, ctx_attn_metadata.untile_combined_index, get_sp_world_size())
+        else:
+            output = self.attn_impl.postprocess_output(output, ctx_attn_metadata)
+            output = torch.nn.functional.pad(output, (0, 0, 0, 0, 0, pad_seq_len))
+            output = sequence_model_parallel_all_to_all_4D(output, scatter_dim=1, gather_dim=2)
         return output, replicated_output
 
 
