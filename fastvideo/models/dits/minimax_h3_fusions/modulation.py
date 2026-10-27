@@ -423,3 +423,307 @@ def fused_residual_gate_rmsnorm_modulate(
         index,
         eps,
     )
+
+
+# ---------------------------------------------------------------------------
+# Same kernels with the absolute maximum of the stored output, for the FP8 path.
+# The dynamic tensorwise FP8 quantization of the next linear needs
+# ``output.abs().amax()``; producing it here saves that separate read of the
+# whole activation. ``tl.atomic_max`` over the BF16-rounded output values gives
+# exactly the eager amax (max is order-independent and exact).
+# ---------------------------------------------------------------------------
+
+if triton is not None:
+
+    @triton.jit
+    def _rmsnorm_modulate_amax_kernel(
+        out_ptr,
+        amax_ptr,
+        x_ptr,
+        weight_ptr,
+        scale_ptr,
+        shift_ptr,
+        index_ptr,
+        n_cols,
+        n_index,
+        eps,
+        stride_x_row,
+        stride_scale_row,
+        stride_shift_row,
+        BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.arange(0, BLOCK)
+        mask = cols < n_cols
+        x_offsets = row * stride_x_row + cols
+        table_row = tl.load(index_ptr + row % n_index).to(tl.int64)
+
+        x = tl.load(x_ptr + x_offsets, mask=mask, other=0.0).to(tl.float32)
+        variance = tl.sum(x * x, axis=0) / n_cols
+        normed = x * tl.math.rsqrt(variance + eps)
+        weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        scale = tl.load(
+            scale_ptr + table_row * stride_scale_row + cols,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        shift = tl.load(
+            shift_ptr + table_row * stride_shift_row + cols,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        output = (normed * weight * (1.0 + scale) + shift).to(out_ptr.dtype.element_ty)
+        tl.store(out_ptr + x_offsets, output, mask=mask)
+        tl.atomic_max(amax_ptr, tl.max(tl.where(mask, tl.abs(output.to(tl.float32)), 0.0), axis=0))
+
+    @triton.jit
+    def _residual_gate_rmsnorm_modulate_amax_kernel(
+        hidden_out_ptr,
+        normed_out_ptr,
+        amax_ptr,
+        residual_ptr,
+        branch_ptr,
+        gate_ptr,
+        weight_ptr,
+        scale_ptr,
+        shift_ptr,
+        index_ptr,
+        n_cols,
+        n_index,
+        eps,
+        stride_input_row,
+        stride_gate_row,
+        stride_scale_row,
+        stride_shift_row,
+        BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.arange(0, BLOCK)
+        mask = cols < n_cols
+        input_offsets = row * stride_input_row + cols
+        table_row = tl.load(index_ptr + row % n_index).to(tl.int64)
+
+        residual = tl.load(residual_ptr + input_offsets, mask=mask, other=0.0).to(tl.float32)
+        branch = tl.load(branch_ptr + input_offsets, mask=mask, other=0.0).to(tl.float32)
+        gate = tl.load(
+            gate_ptr + table_row * stride_gate_row + cols,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        hidden = residual + gate * branch
+        tl.store(hidden_out_ptr + input_offsets, hidden.to(hidden_out_ptr.dtype.element_ty), mask=mask)
+
+        variance = tl.sum(hidden * hidden, axis=0) / n_cols
+        normed = hidden * tl.math.rsqrt(variance + eps)
+        weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        scale = tl.load(
+            scale_ptr + table_row * stride_scale_row + cols,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        shift = tl.load(
+            shift_ptr + table_row * stride_shift_row + cols,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        output = (normed * weight * (1.0 + scale) + shift).to(normed_out_ptr.dtype.element_ty)
+        tl.store(normed_out_ptr + input_offsets, output, mask=mask)
+        tl.atomic_max(amax_ptr, tl.max(tl.where(mask, tl.abs(output.to(tl.float32)), 0.0), axis=0))
+
+
+_FP8_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+_FP8_MIN_SCALE = 1.0 / (_FP8_MAX * 512.0)
+
+
+def _tensorwise_scale(amax: torch.Tensor) -> torch.Tensor:
+    """``fp8_config._quantize_tensorwise``'s scale from the exact amax, computed here (one tiny kernel right after the
+    producer) so the FP8 GEMMs read a scale produced well before them, as in the original quantization."""
+    return (amax / _FP8_MAX).clamp(min=_FP8_MIN_SCALE)
+
+
+def _fused_rmsnorm_modulate_amax_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    index: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _validate_contract(x, weight, (scale, shift), index, eps)
+    _require_forward_only(x, weight, scale, shift)
+    _require_triton_cuda(x)
+
+    hidden_size = x.shape[-1]
+    flat_x = x.reshape(-1, hidden_size).contiguous()
+    weight = weight.contiguous()
+    scale = _row_addressable(scale)
+    shift = _row_addressable(shift)
+    index = index.contiguous()
+    output = torch.empty_like(flat_x)
+    amax = torch.zeros((), device=x.device, dtype=torch.float32)
+    block_size = _next_power_of_two(hidden_size)
+    _rmsnorm_modulate_amax_kernel[(flat_x.shape[0], )](
+        output,
+        amax,
+        flat_x,
+        weight,
+        scale,
+        shift,
+        index,
+        hidden_size,
+        index.numel(),
+        eps,
+        flat_x.stride(0),
+        scale.stride(0),
+        shift.stride(0),
+        BLOCK=block_size,
+        num_warps=_num_warps(block_size),
+    )
+    return output.view_as(x), _tensorwise_scale(amax)
+
+
+def _fused_residual_gate_rmsnorm_modulate_amax_impl(
+    residual: torch.Tensor,
+    branch: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    index: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _validate_residual_branch(residual, branch)
+    _validate_contract(residual, weight, (gate, scale, shift), index, eps)
+    _require_forward_only(residual, branch, gate, weight, scale, shift)
+    _require_triton_cuda(residual)
+
+    hidden_size = residual.shape[-1]
+    flat_residual = residual.reshape(-1, hidden_size).contiguous()
+    flat_branch = branch.reshape(-1, hidden_size).contiguous()
+    weight = weight.contiguous()
+    gate = _row_addressable(gate)
+    scale = _row_addressable(scale)
+    shift = _row_addressable(shift)
+    index = index.contiguous()
+    hidden = torch.empty_like(flat_residual)
+    modulated = torch.empty_like(flat_residual)
+    amax = torch.zeros((), device=residual.device, dtype=torch.float32)
+    block_size = _next_power_of_two(hidden_size)
+    _residual_gate_rmsnorm_modulate_amax_kernel[(flat_residual.shape[0], )](
+        hidden,
+        modulated,
+        amax,
+        flat_residual,
+        flat_branch,
+        gate,
+        weight,
+        scale,
+        shift,
+        index,
+        hidden_size,
+        index.numel(),
+        eps,
+        flat_residual.stride(0),
+        gate.stride(0),
+        scale.stride(0),
+        shift.stride(0),
+        BLOCK=block_size,
+        num_warps=_num_warps(block_size),
+    )
+    return hidden.view_as(residual), modulated.view_as(residual), _tensorwise_scale(amax)
+
+
+@torch.library.custom_op(
+    "fastvideo::_minimax_h3_rmsnorm_modulate_amax",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _fused_rmsnorm_modulate_amax_op(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    index: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _fused_rmsnorm_modulate_amax_impl(x, weight, scale, shift, index, eps)
+
+
+@torch.library.register_fake("fastvideo::_minimax_h3_rmsnorm_modulate_amax")
+def _fused_rmsnorm_modulate_amax_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    index: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del weight, scale, shift, index, eps
+    return x.new_empty(x.shape), x.new_empty((), dtype=torch.float32)
+
+
+@torch.library.custom_op(
+    "fastvideo::_minimax_h3_residual_gate_rmsnorm_modulate_amax",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _fused_residual_gate_rmsnorm_modulate_amax_op(
+    residual: torch.Tensor,
+    branch: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    index: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _fused_residual_gate_rmsnorm_modulate_amax_impl(residual, branch, gate, weight, scale, shift, index, eps)
+
+
+@torch.library.register_fake("fastvideo::_minimax_h3_residual_gate_rmsnorm_modulate_amax")
+def _fused_residual_gate_rmsnorm_modulate_amax_fake(
+    residual: torch.Tensor,
+    branch: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    index: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del branch, gate, weight, scale, shift, index, eps
+    return (residual.new_empty(residual.shape), residual.new_empty(residual.shape),
+            residual.new_empty((), dtype=torch.float32))
+
+
+def fused_rmsnorm_modulate_amax(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    index: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`fused_rmsnorm_modulate` plus ``output.abs().amax()`` as an FP32 scalar."""
+    _require_forward_only(x, weight, scale, shift)
+    if torch.compiler.is_compiling():
+        return torch.ops.fastvideo._minimax_h3_rmsnorm_modulate_amax(x, weight, scale, shift, index, eps)
+    return _fused_rmsnorm_modulate_amax_impl(x, weight, scale, shift, index, eps)
+
+
+def fused_residual_gate_rmsnorm_modulate_amax(
+    residual: torch.Tensor,
+    branch: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    index: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`fused_residual_gate_rmsnorm_modulate` plus the modulated output's ``abs().amax()``."""
+    _require_forward_only(residual, branch, gate, weight, scale, shift)
+    if torch.compiler.is_compiling():
+        return torch.ops.fastvideo._minimax_h3_residual_gate_rmsnorm_modulate_amax(
+            residual, branch, gate, weight, scale, shift, index, eps)
+    return _fused_residual_gate_rmsnorm_modulate_amax_impl(residual, branch, gate, weight, scale, shift, index, eps)

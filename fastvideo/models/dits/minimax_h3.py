@@ -33,6 +33,18 @@ from fastvideo.models.dits.minimax_h3_fusions import (
     fused_rmsnorm_modulate,
     minimax_h3_swiglu,
 )
+from fastvideo.models.dits.minimax_h3_fusions.modulation import (
+    fused_residual_gate_rmsnorm_modulate_amax,
+    fused_rmsnorm_modulate_amax,
+)
+from fastvideo.models.dits.minimax_h3_fusions.swiglu import minimax_h3_swiglu_amax
+from fastvideo.layers.quantization.fp8_config import (
+    FP8_DTYPE,
+    FP8_MAX,
+    FP8_MIN_SCALE,
+    FP8QuantizeMethod,
+    _supports_fp8_compute,
+)
 from fastvideo.platforms import AttentionBackendEnum
 from fastvideo.profiler import nvtx_range
 from fastvideo.utils import get_compute_dtype
@@ -42,6 +54,110 @@ logger = init_logger(__name__)
 MINIMAX_H3_MODALITY_NUM = 3
 _CFG = MiniMaxH3Config()
 _MINIMAX_H3_FUSION_NAMES = frozenset({"modulate", "qknorm_rope", "swiglu"})
+
+
+def _tensorwise_fp8(linear: ReplicatedLinear) -> bool:
+    """Dynamic tensorwise FP8 linear: its input quantization can take a producer-computed amax."""
+    method = linear.quant_method
+    return isinstance(method, FP8QuantizeMethod) and method.granularity == "tensor" and _supports_fp8_compute()
+
+
+def _producer_amax_enabled(part: str) -> bool:
+    """``SOL_H3_PRODUCER_AMAX``: 1 (default, every producer), 0, or a comma list of attn, ff, swiglu."""
+    import os
+    value = os.environ.get("SOL_H3_PRODUCER_AMAX", "1")
+    return value != "0" and (value == "1" or part in value.split(","))
+
+
+def _bits_sum(t: torch.Tensor) -> torch.Tensor:
+    """Sum of the raw bit patterns (int64): changes with any single-element change of ``t``."""
+    width = {1: torch.int8, 2: torch.int16, 4: torch.int32, 8: torch.int64}[t.element_size()]
+    return t.detach().view(width).sum(dtype=torch.int64)
+
+
+_DEBUG_HASH_CALLS = [0]
+
+
+def _debug_metadata_sums() -> list[torch.Tensor]:
+    """Bit sums of every tensor field of the active attention metadata and of the VSA tile buffer (if any)."""
+    import dataclasses
+    from fastvideo.forward_context import get_forward_context
+    metadata = get_forward_context().attn_metadata
+    sums = []
+    if metadata is not None and dataclasses.is_dataclass(metadata):
+        for field in dataclasses.fields(metadata):
+            value = getattr(metadata, field.name)
+            if isinstance(value, torch.Tensor) and value.is_cuda and value.numel():
+                sums.append(_bits_sum(value))
+        holder = getattr(metadata, "tile_buf_holder", None)
+        if holder is not None and holder.buffer is not None:
+            sums.append(_bits_sum(holder.buffer))
+    return sums
+
+
+def _record_weight_sums(where: str, blocks) -> None:
+    """Diagnostics: bit sums of the FP8 q/k/v weights and their scales of the first three blocks (attribute names of
+    the FP8 linear), queued with the attention records so a weight that changes between requests shows up."""
+    sums = []
+    for block in list(blocks)[:3]:
+        for linear in (block.attn.to_q, block.attn.to_k, block.attn.to_v):
+            for owner in (linear, getattr(linear, "base_layer", None)):
+                for name in ("_fp8_weight", "_fp8_weight_scale", "weight"):
+                    tensor = getattr(owner, name, None) if owner is not None else None
+                    if isinstance(tensor, torch.Tensor) and tensor.is_cuda and tensor.numel():
+                        sums.append(_bits_sum(tensor))
+    if sums:
+        torch.__dict__.setdefault("_sol_debug_attn", []).append(("weights", {"where": where}, torch.stack(sums)))
+
+
+def _write_debug_hash(path: str, sums: list[torch.Tensor]) -> None:
+    """``SOL_H3_DEBUG_HASH=DIR``: one JSON line per DiT forward with the bit sums of its inputs, every block output
+    and the outputs (one host sync per forward), to locate where two identical requests diverge."""
+    import json
+    import os
+    _DEBUG_HASH_CALLS[0] += 1
+    with open(os.path.join(path, f"debug-hash-{os.getpid()}.jsonl"), "a") as stream:
+        stream.write(json.dumps({"call": _DEBUG_HASH_CALLS[0], "sums": torch.stack(sums).tolist()}) + "\n")
+    # Attention-call sums kept on the GPU by the Sol VSA overlay (runtime/stage1_ops/vsa.py).
+    pending = torch.__dict__.get("_sol_debug_attn") or []
+    if pending:
+        flat = torch.cat([entry[2] for entry in pending]).tolist()
+        with open(os.path.join(path, f"debug-attn-{os.getpid()}.jsonl"), "a") as stream:
+            start = 0
+            for kind, extra, entry in pending:
+                row, start = flat[start:start + entry.numel()], start + entry.numel()
+                stream.write(json.dumps({"kind": kind, **extra, "forward": _DEBUG_HASH_CALLS[0], "sums": row}) + "\n")
+        pending.clear()
+
+
+_DEBUG_POISON_CALLS = [0]
+
+
+def _debug_poison() -> None:
+    """``SOL_H3_DEBUG_POISON=1``: fill freed caching-allocator blocks with a byte pattern that changes on every DiT
+    forward, so a kernel that reads memory nobody wrote returns different results for identical requests."""
+    _DEBUG_POISON_CALLS[0] += 1
+    pattern = (_DEBUG_POISON_CALLS[0] * 37) % 251 + 1
+    blocks = [torch.full((size,), pattern, device="cuda", dtype=torch.uint8) for size in (1 << 30, 1 << 28, 1 << 26)]
+    blocks += [torch.full((1 << 20,), pattern, device="cuda", dtype=torch.uint8) for _ in range(64)]
+    blocks += [torch.full((512,), pattern, device="cuda", dtype=torch.uint8) for _ in range(256)]
+    del blocks
+
+
+def _quantize_tensorwise_from_scale(x: torch.Tensor,
+                                    x_scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None]:
+    """``fp8_config._quantize_tensorwise`` with its scale supplied by the producing kernel's op.
+
+    The producer computes ``(amax / FP8_MAX).clamp(min=FP8_MIN_SCALE)`` from the exact amax of the BF16 values it
+    stored, i.e. the original scale bit for bit; the quantization below is the original expression.
+    """
+    x_2d = x.reshape(-1, x.shape[-1])
+    x_fp8 = (x_2d / x_scale.to(x_2d.dtype)).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
+    return x_fp8, x_scale.view(1), None
+
+
+def _prequantized_linear(linear: ReplicatedLinear, x: torch.Tensor, pre_quantized) -> torch.Tensor:
+    return linear.quant_method.apply(linear, x, None, pre_quantized=pre_quantized)
 
 
 def _enabled_minimax_h3_fusions(value: str | None = None) -> frozenset[str]:
@@ -120,8 +236,15 @@ class MiniMaxH3FeedForward(nn.Module):
         )
         self.fuse_swiglu = fuse_swiglu
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states, _ = self.fc_in(hidden_states)
+    def forward(self, hidden_states: torch.Tensor, pre_quantized=None) -> torch.Tensor:
+        if pre_quantized is not None:
+            hidden_states = _prequantized_linear(self.fc_in, hidden_states, pre_quantized)
+        else:
+            hidden_states, _ = self.fc_in(hidden_states)
+        if (self.fuse_swiglu and _can_run_minimax_h3_fusion(hidden_states) and _producer_amax_enabled("swiglu")
+                and _tensorwise_fp8(self.fc_out)):
+            hidden_states, scale = minimax_h3_swiglu_amax(hidden_states)
+            return _prequantized_linear(self.fc_out, hidden_states, _quantize_tensorwise_from_scale(hidden_states, scale))
         if self.fuse_swiglu and _can_run_minimax_h3_fusion(hidden_states):
             hidden_states = minimax_h3_swiglu(hidden_states)
         else:
@@ -271,10 +394,16 @@ class MiniMaxH3Attention(nn.Module):
         hidden_states: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
         original_seq_len: int,
+        pre_quantized=None,
     ) -> torch.Tensor:
-        query, _ = self.to_q(hidden_states)
-        key, _ = self.to_k(hidden_states)
-        value, _ = self.to_v(hidden_states)
+        if pre_quantized is not None:
+            query = _prequantized_linear(self.to_q, hidden_states, pre_quantized)
+            key = _prequantized_linear(self.to_k, hidden_states, pre_quantized)
+            value = _prequantized_linear(self.to_v, hidden_states, pre_quantized)
+        else:
+            query, _ = self.to_q(hidden_states)
+            key, _ = self.to_k(hidden_states)
+            value, _ = self.to_v(hidden_states)
         query = query.unflatten(-1, (self.num_attention_heads, self.attention_head_dim))
         key = key.unflatten(-1, (self.num_attention_heads, self.attention_head_dim))
         value = value.unflatten(-1, (self.num_attention_heads, self.attention_head_dim))
@@ -295,7 +424,10 @@ class MiniMaxH3Attention(nn.Module):
         # branch cannot express. Apply it above, then pass no RoPE here.
         extra_attention_kwargs = {}
         if self.to_gate_compress is not None and self._gate_active():
-            gate_compress, _ = self.to_gate_compress(hidden_states)
+            if pre_quantized is not None and _tensorwise_fp8(self.to_gate_compress):
+                gate_compress = _prequantized_linear(self.to_gate_compress, hidden_states, pre_quantized)
+            else:
+                gate_compress, _ = self.to_gate_compress(hidden_states)
             extra_attention_kwargs["gate_compress"] = gate_compress.unflatten(
                 -1, (self.num_attention_heads, self.attention_head_dim))
         hidden_states, _ = self.distributed_attention(
@@ -518,6 +650,46 @@ class MiniMaxH3TransformerBlock(nn.Module):
             t.to(hidden_states.dtype) for t in self.adaln_proj(temb))
 
         use_modulate_fusion = self.fuse_modulate and _can_run_minimax_h3_fusion(hidden_states)
+        attention_amax_producer = (use_modulate_fusion and _producer_amax_enabled("attn")
+                                   and _tensorwise_fp8(self.attn.to_q) and _tensorwise_fp8(self.attn.to_k)
+                                   and _tensorwise_fp8(self.attn.to_v))
+        ff_amax_producer = use_modulate_fusion and _producer_amax_enabled("ff") and _tensorwise_fp8(self.ff.fc_in)
+        if attention_amax_producer or ff_amax_producer:
+            if attention_amax_producer:
+                norm_hidden_states, attention_scale = fused_rmsnorm_modulate_amax(
+                    hidden_states,
+                    self.norm1.weight,
+                    scale_msa,
+                    shift_msa,
+                    adaln_indices,
+                    self.norm1.eps,
+                )
+                attention_output = self.attn(norm_hidden_states, rotary_emb, original_seq_len,
+                                             pre_quantized=_quantize_tensorwise_from_scale(norm_hidden_states,
+                                                                                          attention_scale))
+            else:
+                norm_hidden_states = fused_rmsnorm_modulate(hidden_states, self.norm1.weight, scale_msa, shift_msa,
+                                                            adaln_indices, self.norm1.eps)
+                attention_output = self.attn(norm_hidden_states, rotary_emb, original_seq_len)
+            if ff_amax_producer:
+                hidden_states, norm_hidden_states, ff_scale = fused_residual_gate_rmsnorm_modulate_amax(
+                    hidden_states,
+                    attention_output,
+                    gate_msa,
+                    self.norm2.weight,
+                    scale_mlp,
+                    shift_mlp,
+                    adaln_indices,
+                    self.norm2.eps,
+                )
+                feed_forward_output = self.ff(norm_hidden_states,
+                                              pre_quantized=_quantize_tensorwise_from_scale(norm_hidden_states, ff_scale))
+            else:
+                hidden_states, norm_hidden_states = fused_residual_gate_rmsnorm_modulate(
+                    hidden_states, attention_output, gate_msa, self.norm2.weight, scale_mlp, shift_mlp,
+                    adaln_indices, self.norm2.eps)
+                feed_forward_output = self.ff(norm_hidden_states)
+            return hidden_states + gate_mlp.index_select(0, adaln_indices) * feed_forward_output
         if use_modulate_fusion:
             norm_hidden_states = fused_rmsnorm_modulate(
                 hidden_states,
@@ -891,6 +1063,9 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
         if encoder_hidden_states.shape[1] != text_indices.numel():
             raise ValueError("encoder_hidden_states row count must match text_indices.")
 
+        import os
+        if os.environ.get("SOL_H3_DEBUG_POISON") == "1":
+            _debug_poison()
         video_embeds, _ = self.proj_in(hidden_states.to(self.proj_in.weight.dtype))
         audio_embeds, _ = self.audio_proj_in(audio_hidden_states.to(self.audio_proj_in.weight.dtype))
         text_embeds = self._refined_text(encoder_hidden_states)
@@ -912,6 +1087,13 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
         adaln_indices = timestep_indices * MINIMAX_H3_MODALITY_NUM + token_tags
         local_timestep_indices = timestep_indices
         original_seq_len = sequence_length
+        import os
+        debug_hash = os.environ.get("SOL_H3_DEBUG_HASH")
+        sums = [_bits_sum(t) for t in (hidden_states, audio_hidden_states, encoder_hidden_states, timestep, temb,
+                                       packed_hidden_states, rotary_emb[0], rotary_emb[1], adaln_indices)
+                ] + _debug_metadata_sums() if debug_hash else None
+        if debug_hash:
+            _record_weight_sums("entry", self.transformer_blocks)
 
         if sp_world_size > 1:
             packed_hidden_states, _ = sequence_model_parallel_shard(packed_hidden_states, dim=1)
@@ -932,6 +1114,11 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
                     rotary_emb,
                     original_seq_len,
                 )
+            if debug_hash:
+                sums.append(_bits_sum(packed_hidden_states))
+                sums.extend(_debug_metadata_sums()[-1:])
+            if os.environ.get("SOL_DEBUG_SYNC") == "block":
+                torch.cuda.synchronize()  # diagnostics: keep the CPU from running ahead of the GPU
 
         packed_hidden_states = self.norm_out(
             packed_hidden_states,
@@ -945,6 +1132,9 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
             audio_output = sequence_model_parallel_all_gather_with_unpad(audio_output, original_seq_len, dim=1)
         video_output = video_output.index_select(1, video_indices)
         audio_output = audio_output.index_select(1, audio_indices)
+        if debug_hash:
+            _record_weight_sums("exit", self.transformer_blocks)
+            _write_debug_hash(debug_hash, sums + [_bits_sum(video_output), _bits_sum(audio_output)])
 
         return video_output, audio_output
 
