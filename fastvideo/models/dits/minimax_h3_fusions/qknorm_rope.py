@@ -32,44 +32,53 @@ if HAVE_TRITON:
         half_rotary_dim,
         num_heads,
         seq_len,
+        n_rows,
         eps,
         BLOCK_SIZE: tl.constexpr,
+        HEADS: tl.constexpr,
     ):
+        # h3-qknorm overlay: HEADS consecutive heads per program, each with the
+        # deployed per-head code unchanged (same BLOCK_SIZE and num_warps, so the
+        # same reduction; bit for bit, tests/bench_qknorm_heads.py). One head per
+        # program left the kernel at 75% of the copy bandwidth.
+        #
         # int64, like the sibling kernels: with int32 program ids,
         # ``row * head_dim`` wraps once the flattened input reaches 2**31
         # elements (H3's 56 heads x 128 head_dim crosses that at
         # batch*seq >= 299_593 tokens per rank) and the loads/stores below
         # become out-of-bounds. ``seq_index`` inherits int64 from ``row``.
-        row = tl.program_id(0).to(tl.int64)
-        seq_index = (row // num_heads) % seq_len
-        cols = tl.arange(0, BLOCK_SIZE)
-        head_mask = cols < head_dim
-        row_offset = row * head_dim
+        for i in tl.static_range(HEADS):
+            row = tl.program_id(0).to(tl.int64) * HEADS + i
+            if row < n_rows:
+                seq_index = (row // num_heads) % seq_len
+                cols = tl.arange(0, BLOCK_SIZE)
+                head_mask = cols < head_dim
+                row_offset = row * head_dim
 
-        x = tl.load(x_ptr + row_offset + cols, mask=head_mask, other=0.0).to(tl.float32)
-        variance = tl.sum(x * x, axis=0) / head_dim
-        inv_rms = tl.math.rsqrt(variance + eps)
-        weight = tl.load(weight_ptr + cols, mask=head_mask, other=0.0).to(tl.float32)
-        normalized = x * inv_rms * weight
+                x = tl.load(x_ptr + row_offset + cols, mask=head_mask, other=0.0).to(tl.float32)
+                variance = tl.sum(x * x, axis=0) / head_dim
+                inv_rms = tl.math.rsqrt(variance + eps)
+                weight = tl.load(weight_ptr + cols, mask=head_mask, other=0.0).to(tl.float32)
+                normalized = x * inv_rms * weight
 
-        rotary_mask = cols < rotary_dim
-        first_half = cols < half_rotary_dim
-        partner_col = tl.where(first_half, cols + half_rotary_dim, cols - half_rotary_dim)
-        partner_x = tl.load(
-            x_ptr + row_offset + partner_col,
-            mask=rotary_mask,
-            other=0.0,
-        ).to(tl.float32)
-        partner_weight = tl.load(weight_ptr + partner_col, mask=rotary_mask, other=0.0).to(tl.float32)
-        partner_normalized = partner_x * inv_rms * partner_weight
-        rotated = tl.where(first_half, -partner_normalized, partner_normalized)
+                rotary_mask = cols < rotary_dim
+                first_half = cols < half_rotary_dim
+                partner_col = tl.where(first_half, cols + half_rotary_dim, cols - half_rotary_dim)
+                partner_x = tl.load(
+                    x_ptr + row_offset + partner_col,
+                    mask=rotary_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                partner_weight = tl.load(weight_ptr + partner_col, mask=rotary_mask, other=0.0).to(tl.float32)
+                partner_normalized = partner_x * inv_rms * partner_weight
+                rotated = tl.where(first_half, -partner_normalized, partner_normalized)
 
-        table_offset = seq_index * rotary_dim + cols
-        cos = tl.load(cos_ptr + table_offset, mask=rotary_mask, other=1.0).to(tl.float32)
-        sin = tl.load(sin_ptr + table_offset, mask=rotary_mask, other=0.0).to(tl.float32)
-        rotary_output = normalized * cos + rotated * sin
-        output = tl.where(rotary_mask, rotary_output, normalized)
-        tl.store(out_ptr + row_offset + cols, output.to(out_ptr.dtype.element_ty), mask=head_mask)
+                table_offset = seq_index * rotary_dim + cols
+                cos = tl.load(cos_ptr + table_offset, mask=rotary_mask, other=1.0).to(tl.float32)
+                sin = tl.load(sin_ptr + table_offset, mask=rotary_mask, other=0.0).to(tl.float32)
+                rotary_output = normalized * cos + rotated * sin
+                output = tl.where(rotary_mask, rotary_output, normalized)
+                tl.store(out_ptr + row_offset + cols, output.to(out_ptr.dtype.element_ty), mask=head_mask)
 
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -143,7 +152,8 @@ def _fused_qknorm_rope_impl(
     flat_x = x.reshape(-1, head_dim).contiguous()
     flat_out = torch.empty_like(flat_x)
     block_size = 1 << (head_dim - 1).bit_length()
-    _qknorm_partial_rope_kernel[(flat_x.shape[0], )](
+    heads_per_program = 8
+    _qknorm_partial_rope_kernel[(triton.cdiv(flat_x.shape[0], heads_per_program), )](
         flat_out,
         flat_x,
         weight,
@@ -154,8 +164,10 @@ def _fused_qknorm_rope_impl(
         rotary_dim // 2,
         num_heads,
         seq_len,
+        flat_x.shape[0],
         eps,
         BLOCK_SIZE=block_size,
+        HEADS=heads_per_program,
         num_warps=4,
     )
     return flat_out.view(batch, seq_len, num_heads, head_dim)
