@@ -26,12 +26,13 @@ class BaseLayerWithLoRA(nn.Module):
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
         training_mode: bool = False,
+        retain_cpu_weight: bool = True,
     ):
         super().__init__()
         self.base_layer: nn.Module = base_layer
 
         self.merged: bool = False
-        self.cpu_weight = base_layer.weight.to("cpu")
+        self.cpu_weight: torch.Tensor | None = (base_layer.weight.to("cpu") if retain_cpu_weight else None)
         # indicates adapter weights don't contain this layer
         # (which shouldn't normally happen, but we want to separate it from the case of erroneous merging)
         self.disable_lora: bool = False
@@ -204,6 +205,10 @@ class BaseLayerWithLoRA(nn.Module):
             if if_merged_only:
                 return
             raise ValueError("unmerge_lora_weights called but no LoRA is currently merged")
+        if self.cpu_weight is None:
+            raise RuntimeError(
+                "Constructor-time dense LoRA does not retain a CPU master and cannot be unmerged; "
+                "create a new VideoGenerator instead.")
 
         # avoid precision loss
         if isinstance(self.base_layer.weight, DTensor):
@@ -242,8 +247,9 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
         training_mode: bool = False,
+        retain_cpu_weight: bool = True,
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, training_mode)
+        super().__init__(base_layer, lora_rank, lora_alpha, training_mode, retain_cpu_weight)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         # duplicate the logic in ColumnParallelLinear
@@ -273,8 +279,9 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
         training_mode: bool = False,
+        retain_cpu_weight: bool = True,
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, training_mode)
+        super().__init__(base_layer, lora_rank, lora_alpha, training_mode, retain_cpu_weight)
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A.to(self.base_layer.weight)
@@ -296,8 +303,9 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
         training_mode: bool = False,
+        retain_cpu_weight: bool = True,
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, training_mode)
+        super().__init__(base_layer, lora_rank, lora_alpha, training_mode, retain_cpu_weight)
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A
@@ -328,8 +336,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
         training_mode: bool = False,
+        retain_cpu_weight: bool = True,
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, training_mode)
+        super().__init__(base_layer, lora_rank, lora_alpha, training_mode, retain_cpu_weight)
 
     def forward(self, input_: torch.Tensor):
         # duplicate the logic in RowParallelLinear
@@ -372,7 +381,8 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 def get_lora_layer(layer: nn.Module,
                    lora_rank: int | None = None,
                    lora_alpha: int | None = None,
-                   training_mode: bool = False) -> BaseLayerWithLoRA | None:
+                   training_mode: bool = False,
+                   retain_cpu_weight: bool = True) -> BaseLayerWithLoRA | None:
     supported_layer_types: dict[type[LinearBase], type[BaseLayerWithLoRA]] = {
         # the order matters
         # VocabParallelEmbedding: VocabParallelEmbeddingWithLoRA,
@@ -384,7 +394,11 @@ def get_lora_layer(layer: nn.Module,
     }
     for src_layer_type, lora_layer_type in supported_layer_types.items():
         if isinstance(layer, src_layer_type):  # pylint: disable=unidiomatic-typecheck
-            ret = lora_layer_type(layer, lora_rank=lora_rank, lora_alpha=lora_alpha, training_mode=training_mode)
+            ret = lora_layer_type(layer,
+                                  lora_rank=lora_rank,
+                                  lora_alpha=lora_alpha,
+                                  training_mode=training_mode,
+                                  retain_cpu_weight=retain_cpu_weight)
             return ret
     return None
 

@@ -269,7 +269,7 @@ class LoRAPipeline(ComposedPipelineBase):
         self.exclude_lora_layers[transformer_name] = excluded
         return excluded
 
-    def _apply_constructor_adapter(self) -> None:
+    def _apply_constructor_adapter(self, *, mapping_transformer: nn.Module | None = None) -> None:
         if self.lora_path is None:
             return
         self.cur_adapter_name = ""
@@ -280,6 +280,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 self.lora_nickname,
                 self.lora_path,
                 strength=self.lora_strength,
+                _constructor_mapping_transformer=mapping_transformer,
             )
         finally:
             self._setting_constructor_adapter = False
@@ -323,6 +324,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         lora_rank=self.lora_rank,
                         lora_alpha=self.lora_alpha,
                         training_mode=self.training_mode,
+                        retain_cpu_weight=(self.training_mode or self._constructor_dense_lora_path is None),
                     )
                     if layer is not None:
                         block_name_split = name.split(".", 2)
@@ -357,7 +359,9 @@ class LoRAPipeline(ComposedPipelineBase):
 
                 def _lora_after_load(module: nn.Module, *, _name: str = transformer_name) -> nn.Module:
                     self._convert_one_transformer(_name, module)
-                    self._apply_constructor_adapter()
+                    self._apply_constructor_adapter(
+                        mapping_transformer=module if _name == "transformer" else None,
+                    )
                     return module
 
                 transformer_module.add_release_callback(_drop_lora_refs)
@@ -369,7 +373,9 @@ class LoRAPipeline(ComposedPipelineBase):
                          lora_nickname: str,
                          lora_path: str | None = None,
                          strength: float = 1.0,
-                         accumulate: bool = False):  # type: ignore
+                         accumulate: bool = False,
+                         *,
+                         _constructor_mapping_transformer: nn.Module | None = None):  # type: ignore
         """
         Load a LoRA adapter into the pipeline and merge it into the transformer.
         Args:
@@ -382,6 +388,13 @@ class LoRAPipeline(ComposedPipelineBase):
 
         if not math.isfinite(strength):
             raise ValueError(f"LoRA strength must be finite, got {strength}")
+        if _constructor_mapping_transformer is not None:
+            if not self._setting_constructor_adapter:
+                raise RuntimeError(
+                    "The concrete transformer mapping override is only valid while applying a constructor adapter")
+            if is_lazy_module(_constructor_mapping_transformer):
+                raise RuntimeError(
+                    "The constructor mapping override must be the in-flight concrete transformer, not a LazyModule")
 
         requested_path = lora_path or self.lora_adapter_paths.get(lora_nickname)
         exact_current_adapter = (self.cur_adapter_name == lora_nickname and self.cur_adapter_path == requested_path
@@ -412,8 +425,10 @@ class LoRAPipeline(ComposedPipelineBase):
             lora_state_dict = load_file(lora_local_path)
 
             # Map the hf layer names to our custom layer names
-            param_names_mapping_fn = get_param_names_mapping(self.modules["transformer"].param_names_mapping)
-            lora_param_names_mapping_fn = get_param_names_mapping(self.modules["transformer"].lora_param_names_mapping)
+            mapping_transformer = (_constructor_mapping_transformer
+                                   if _constructor_mapping_transformer is not None else self.modules["transformer"])
+            param_names_mapping_fn = get_param_names_mapping(mapping_transformer.param_names_mapping)
+            lora_param_names_mapping_fn = get_param_names_mapping(mapping_transformer.lora_param_names_mapping)
 
             # Extract alpha values and weights in a single pass
             to_merge_params: defaultdict[Hashable, dict[Any, Any]] = (defaultdict(dict))

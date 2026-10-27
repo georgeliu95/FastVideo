@@ -182,7 +182,7 @@ class DenseLoRAPatch:
             raise ValueError(f"LoRA diff for {param_name} has shape {tuple(delta.shape)}, "
                              f"but the parameter is {tuple(tensor.shape)}")
         self._applied.add(param_name)
-        return tensor.to(torch.float32) + delta.to(torch.float32) * self._strength
+        return tensor.to(torch.float32) + delta.to(device=tensor.device, dtype=torch.float32) * self._strength
 
     def provides(self, param_name: str) -> bool:
         """Whether the adapter carries this parameter whole, without reading it."""
