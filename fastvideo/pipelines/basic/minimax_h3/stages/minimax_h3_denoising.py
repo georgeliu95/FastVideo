@@ -6,6 +6,9 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from spark_profile.sol_state import PROFILES
+
+_PROFILE = PROFILES["stage1"]
 
 from fastvideo.attention.selector import component_attention_backend, get_attn_backend
 from fastvideo.distributed import get_local_torch_device
@@ -154,9 +157,12 @@ class MiniMaxH3DenoisingStage(PipelineStage):
         try:
             # The stage range groups the complete denoising loop while the
             # indexed model ranges retain timing detail for every H3 block.
-            with profiler_region("inference_denoising"), nvtx_range("minimax_h3.dit"):
-                for index, (video_timestep,
-                            audio_timestep) in enumerate(zip(video_timesteps, audio_timesteps, strict=True)):
+            with (
+                profiler_region("inference_denoising"), nvtx_range("minimax_h3.dit"),
+                _PROFILE.iterations("denoise/h3/step", enumerate(zip(
+                    video_timesteps, audio_timesteps, strict=True))) as profile_steps,
+            ):
+                for index, (video_timestep, audio_timestep) in profile_steps:
                     unique_timesteps, timestep_indices = row_timestep_plan[index]
                     attn_metadata = None
                     if vsa_metadata_builder is not None:
