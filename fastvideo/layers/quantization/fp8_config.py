@@ -24,6 +24,16 @@ logger = logging.getLogger(__name__)
 
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = float(torch.finfo(FP8_DTYPE).max)  # 448.0
+
+
+def _load_rowwise_mm():
+    """h3-rowwise: the GB10 CuTe row/column-scaled GEMM (gb10_rowwise/) as the custom op
+    sol_h3::fp8_rowwise_mm, registered at import so compiled graphs call it without a graph break."""
+    from fastvideo.layers.quantization.gb10_rowwise import cute_fp8  # noqa: F401  (registers the op)
+    return torch.ops.sol_h3.fp8_rowwise_mm
+
+
+_ROWWISE_MM = _load_rowwise_mm()
 FP8_MIN_SCALE = 1.0 / (FP8_MAX * 512.0)
 
 # Wan's "to_q"/"to_k"/"to_v" also substring-match Kandinsky5's "to_query"/
@@ -144,13 +154,16 @@ class FP8QuantizeMethod(QuantizeMethodBase):
         w_scale = layer._fp8_weight_scale
         scale_b = w_scale.view(1, -1) if self.granularity == "channel" else w_scale
 
-        out = torch._scaled_mm(
-            x_fp8,
-            w_fp8.t(),
-            scale_a=x_scale,
-            scale_b=scale_b,
-            out_dtype=torch.bfloat16,
-        )
+        if self.granularity == "channel":
+            out = _ROWWISE_MM(x_fp8, w_fp8.t(), x_scale, scale_b)
+        else:
+            out = torch._scaled_mm(
+                x_fp8,
+                w_fp8.t(),
+                scale_a=x_scale,
+                scale_b=scale_b,
+                out_dtype=torch.bfloat16,
+            )
         if isinstance(out, tuple):
             out = out[0]
         if bias is not None:

@@ -51,6 +51,22 @@ from fastvideo.utils import get_compute_dtype
 
 logger = init_logger(__name__)
 
+
+def _load_rowwise_fusions() -> None:
+    """h3-rowwise: register sol_h3::rmsnorm_modulate_rowwise, residual_gate_rmsnorm_modulate_rowwise and
+    swiglu_rowwise (minimax_h3_fusions/rowwise.py)."""
+    from fastvideo.models.dits.minimax_h3_fusions import rowwise  # noqa: F401
+
+
+_load_rowwise_fusions()
+
+
+def _rowwise_fp8(linear: ReplicatedLinear) -> bool:
+    """FP8 linear with per-output-channel weight and per-token activation scales (h3-rowwise stage1.py)."""
+    method = getattr(linear, "quant_method", None)
+    return isinstance(method, FP8QuantizeMethod) and method.granularity == "channel" and _supports_fp8_compute()
+
+
 MINIMAX_H3_MODALITY_NUM = 3
 _CFG = MiniMaxH3Config()
 _MINIMAX_H3_FUSION_NAMES = frozenset({"modulate", "qknorm_rope", "swiglu"})
@@ -241,6 +257,11 @@ class MiniMaxH3FeedForward(nn.Module):
             hidden_states = _prequantized_linear(self.fc_in, hidden_states, pre_quantized)
         else:
             hidden_states, _ = self.fc_in(hidden_states)
+        if self.fuse_swiglu and _can_run_minimax_h3_fusion(hidden_states) and _rowwise_fp8(self.fc_out):
+            # h3-rowwise: SwiGLU writes fc_out's FP8 rows and their scales; no BF16 activation.
+            act_fp8, act_scale = torch.ops.sol_h3.swiglu_rowwise(hidden_states)
+            return _prequantized_linear(self.fc_out, act_fp8.view(*hidden_states.shape[:-1], -1),
+                                        (act_fp8, act_scale, None))
         if (self.fuse_swiglu and _can_run_minimax_h3_fusion(hidden_states) and _producer_amax_enabled("swiglu")
                 and _tensorwise_fp8(self.fc_out)):
             hidden_states, scale = minimax_h3_swiglu_amax(hidden_states)
@@ -650,6 +671,20 @@ class MiniMaxH3TransformerBlock(nn.Module):
             t.to(hidden_states.dtype) for t in self.adaln_proj(temb))
 
         use_modulate_fusion = self.fuse_modulate and _can_run_minimax_h3_fusion(hidden_states)
+        if (use_modulate_fusion and _rowwise_fp8(self.attn.to_q) and _rowwise_fp8(self.attn.to_k)
+                and _rowwise_fp8(self.attn.to_v) and _rowwise_fp8(self.ff.fc_in)):
+            # h3-rowwise: the producers write the FP8 rows and per-token scales of the q/k/v and fc_in inputs (the
+            # BF16 normed input stays for the BF16 gate-compression projection; the FF one is not written).
+            norm_hidden_states, qkv_fp8, qkv_scale = torch.ops.sol_h3.rmsnorm_modulate_rowwise(
+                hidden_states, self.norm1.weight, scale_msa, shift_msa, adaln_indices, self.norm1.eps)
+            attention_output = self.attn(norm_hidden_states, rotary_emb, original_seq_len,
+                                         pre_quantized=(qkv_fp8, qkv_scale, None))
+            hidden_states, ff_fp8, ff_scale = torch.ops.sol_h3.residual_gate_rmsnorm_modulate_rowwise(
+                hidden_states, attention_output, gate_msa, self.norm2.weight, scale_mlp, shift_mlp, adaln_indices,
+                self.norm2.eps)
+            feed_forward_output = self.ff(ff_fp8.view(*hidden_states.shape[:-1], -1),
+                                          pre_quantized=(ff_fp8, ff_scale, None))
+            return hidden_states + gate_mlp.index_select(0, adaln_indices) * feed_forward_output
         attention_amax_producer = (use_modulate_fusion and _producer_amax_enabled("attn")
                                    and _tensorwise_fp8(self.attn.to_q) and _tensorwise_fp8(self.attn.to_k)
                                    and _tensorwise_fp8(self.attn.to_v))
