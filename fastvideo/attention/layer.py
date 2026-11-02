@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import weakref
 from functools import wraps
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -9,7 +11,7 @@ import torch.nn as nn
 from fastvideo.attention.selector import backend_name_to_enum, get_attn_backend
 from fastvideo.distributed.communication_op import (sequence_model_parallel_all_gather,
                                                     sequence_model_parallel_all_to_all_4D)
-from fastvideo.distributed.parallel_state import (get_sp_parallel_rank, get_sp_world_size)
+from fastvideo.distributed.parallel_state import (get_sp_group, get_sp_parallel_rank, get_sp_world_size)
 from fastvideo.forward_context import ForwardContext, get_forward_context
 from fastvideo.platforms import AttentionBackendEnum
 from fastvideo.utils import get_compute_dtype
@@ -193,9 +195,89 @@ class DistributedAttention(nn.Module):
         return output, replicated_output
 
 
+# Sol-H3-Spark v4.4: VSA attention with its Ulysses exchanges pipelined over head groups by the ulysses_head_pipeline
+# package (gitlab-master georgel/ulysses-head-pipeline; imported only when enabled), SPARK_CP_H3_PIPELINE_GROUPS = G > 1
+# groups per rank. SPARK_CP_H3_PIPELINE_CHECK = N compares the first N calls of every layer with the unpipelined
+# exchange, bit for bit: only meaningful when the attention's bits per head do not depend on the group size (VSA-H3
+# on GB10 needs Sol-H3-Spark's exact mode, SPARK_CP_H3_PIPELINE_EXACT=1).
+_H3_PIPELINE_GROUPS = int(os.environ.get("SPARK_CP_H3_PIPELINE_GROUPS", "1"))
+_H3_PIPELINE_LAYERS: list[weakref.ref] = []
+
+
+@torch.library.custom_op("fastvideo_sp::vsa_head_group_pipeline", mutates_args=(), device_types="cuda")
+def _vsa_head_group_pipeline(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        gate: Optional[torch.Tensor],  # noqa: UP045 -- the custom-op schema spelling
+        layer: torch.Tensor,
+        original_seq_len: int) -> torch.Tensor:
+    """Opaque to the regional fullgraph compile: the pipeline orders streams and calls the attention per group.
+    ``layer`` is a CPU int64 scalar so the 50 block instances share one graph."""
+    module = _H3_PIPELINE_LAYERS[int(layer)]()
+    return module._pipelined_forward(q, k, v, gate, original_seq_len)
+
+
+@_vsa_head_group_pipeline.register_fake
+def _vsa_head_group_pipeline_fake(q, k, v, gate, layer, original_seq_len):
+    return q.new_empty((*q.shape[:-1], v.shape[-1]))
+
+
 class DistributedAttention_VSA(DistributedAttention):
     """Distributed attention layer with VSA support.
     """
+
+    # Optional transport for the head-group pipeline's exchanges instead of NCCL (2 ranks), set by the caller before
+    # the first forward: transport_factory(group, nbytes, slots) -> transport (ulysses_head_pipeline.HeadGroupPipeline),
+    # e.g. ulysses_head_pipeline.spark_rdma.factory(...) (RDMA from host-pinned buffers on DGX Spark).
+    pipeline_transport_factory = None
+    # Process-wide: pipelined forwards, inner attention calls they made (G each, plus one per check) and checks.
+    pipeline_stats = {"calls": 0, "attention_calls": 0, "checks": 0, "groups": _H3_PIPELINE_GROUPS, "transport": None}
+    _pipeline = None  # ulysses_head_pipeline.HeadGroupPipeline, made at the first pipelined call
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._pipeline_index = torch.tensor(len(_H3_PIPELINE_LAYERS), dtype=torch.int64, device="cpu")
+        _H3_PIPELINE_LAYERS.append(weakref.ref(self))
+        self._pipeline_checks = int(os.environ.get("SPARK_CP_H3_PIPELINE_CHECK", "0"))
+
+    def _pipelined_forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, gate_compress: torch.Tensor | None,
+                           original_seq_len: int) -> torch.Tensor:
+        cls = DistributedAttention_VSA
+        if cls._pipeline is None:
+            from ulysses_head_pipeline import HeadGroupPipeline
+            cls._pipeline = HeadGroupPipeline(get_sp_group().device_group,
+                                              _H3_PIPELINE_GROUPS,
+                                              cls.pipeline_transport_factory,
+                                              name="h3 pipeline")
+        ctx_attn_metadata = get_forward_context().attn_metadata
+        impl = self.attn_impl
+        xs = [q, k, v] if gate_compress is None else [q, k, v, gate_compress]
+
+        def attention(x: torch.Tensor, group: int) -> torch.Tensor:
+            parts = impl.preprocess_qkv(x, ctx_attn_metadata).chunk(len(xs), dim=0)
+            gate = parts[3] if len(parts) == 4 else None
+            output = impl.forward(parts[0], parts[1], parts[2], gate, ctx_attn_metadata)  # type: ignore[call-arg]
+            return impl.postprocess_output(output, ctx_attn_metadata)
+
+        result = cls._pipeline.run(xs, attention, original_seq_len)  # fresh [1, t, heads, d]
+        stats = cls.pipeline_stats
+        stats["calls"] += 1
+        stats["attention_calls"] += _H3_PIPELINE_GROUPS
+        stats["transport"] = cls._pipeline.describe()
+        if self._pipeline_checks > 0:
+            self._pipeline_checks -= 1
+            reference = self._exchange_attention(q, k, v, gate_compress, original_seq_len, None, ctx_attn_metadata)
+            stats["checks"] += 1
+            stats["attention_calls"] += 1
+            same = bool(torch.equal(result, reference))
+            print(
+                f"[h3 pipeline] rank {get_sp_parallel_rank()} groups {_H3_PIPELINE_GROUPS} heads {q.shape[2]} "
+                f"tokens {q.shape[1]} ({stats['transport']}): equal to the unpipelined exchange {same}",
+                flush=True)
+            if not same:
+                raise RuntimeError("head-group pipelined VSA attention differs from the unpipelined exchange")
+        return result
 
     @_maybe_compiler_disable
     def forward(
@@ -236,6 +318,19 @@ class DistributedAttention_VSA(DistributedAttention):
         ctx_attn_metadata = forward_context.attn_metadata
 
         batch_size, seq_len, num_heads, head_dim = q.shape
+        if (_H3_PIPELINE_GROUPS > 1 and get_sp_world_size() > 1 and batch_size == 1 and freqs_cis is None
+                and num_heads % (get_sp_world_size() * _H3_PIPELINE_GROUPS) == 0 and k.shape == q.shape
+                and v.shape == q.shape and (gate_compress is None or gate_compress.shape == q.shape)):
+            output = _vsa_head_group_pipeline(q, k, v, gate_compress, self._pipeline_index, original_seq_len)
+            return output, None
+        return self._exchange_attention(q, k, v, gate_compress, original_seq_len, freqs_cis, ctx_attn_metadata), None
+
+    def _exchange_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, gate_compress: torch.Tensor | None,
+                            original_seq_len: int, freqs_cis: tuple[torch.Tensor, torch.Tensor] | None,
+                            ctx_attn_metadata) -> torch.Tensor:
+        """The unpipelined exchange: one all-to-all of the stacked inputs, attention over all local heads, one
+        all-to-all of the output."""
+        batch_size = q.shape[0]
         # Stack QKV (a caller with a structurally-zero gate passes None and
         # skips the gate's share of the all-to-all/tile traffic)
         stack = [q, k, v] if gate_compress is None else [q, k, v, gate_compress]
@@ -262,9 +357,6 @@ class DistributedAttention_VSA(DistributedAttention):
             q, k, v, gate_compress = qkvg.chunk(4, dim=0)
         output = self.attn_impl.forward(q, k, v, gate_compress, ctx_attn_metadata)  # type: ignore[call-arg]
 
-        # Redistribute back if using sequence parallelism
-        replicated_output = None
-
         # Apply backend-specific postprocess_output
         if os.environ.get("SPARK_CP_H3_PACK", "0") == "1" and get_sp_world_size() > 1:
             from runtime.stage1_ops.cp_transport import reverse_tiled_exchange
@@ -273,7 +365,7 @@ class DistributedAttention_VSA(DistributedAttention):
             output = self.attn_impl.postprocess_output(output, ctx_attn_metadata)
             output = torch.nn.functional.pad(output, (0, 0, 0, 0, 0, pad_seq_len))
             output = sequence_model_parallel_all_to_all_4D(output, scatter_dim=1, gather_dim=2)
-        return output, replicated_output
+        return output
 
 
 class LocalAttention(nn.Module):
