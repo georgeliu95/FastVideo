@@ -14,6 +14,8 @@ classifiers = [
 ]
 
 dependencies = [
+    # Sol-H3-Spark: installed RDMA package shared with the unified environment.
+    "ulysses-head-pipeline @ git+ssh://git@gitlab-master.nvidia.com:12051/georgel/ulysses-head-pipeline.git@e35219a3f55e1f7fa09f865a286858f5adc49529",
     # Core Libraries
     "scipy>=1.14.1",
     "six>=1.16.0",
