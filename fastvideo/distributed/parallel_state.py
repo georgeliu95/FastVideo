@@ -22,6 +22,7 @@ The typical workflow is:
 If you only need to use the distributed environment without model parallelism,
  you can skip the model parallel initialization and destruction steps.
 """
+from ulysses_head_pipeline import collective_ops as rdma_ops
 import contextlib
 import gc
 import os
@@ -162,7 +163,7 @@ class GroupCoordinator:
         self.cpu_group = None
 
         for ranks in group_ranks:
-            device_group = torch.distributed.new_group(ranks, backend=torch_distributed_backend)
+            device_group = torch.distributed.new_group(ranks, backend="gloo")
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
             cpu_group = torch.distributed.new_group(ranks, backend="gloo")
@@ -189,8 +190,7 @@ class GroupCoordinator:
         if use_device_communicator and self.world_size > 1:
             # Platform-aware device communicator selection
             if current_platform.is_cuda_alike():
-                from fastvideo.distributed.device_communicators.cuda_communicator import (CudaCommunicator)
-                self.device_communicator = CudaCommunicator(
+                self.device_communicator = DeviceCommunicatorBase(
                     cpu_group=self.cpu_group,
                     device=self.device,
                     device_group=self.device_group,
@@ -355,7 +355,7 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
         # Broadcast.
-        torch.distributed.broadcast(input_, src=self.ranks[src], group=self.device_group)
+        rdma_ops.broadcast(input_, src=self.ranks[src], group=self.device_group)
         return input_
 
     def broadcast_object(self, obj: Any | None = None, src: int = 0):
@@ -473,13 +473,10 @@ class GroupCoordinator:
                     continue
                 if tensor.is_cpu:
                     # use metadata_group for CPU tensors
-                    handle = torch.distributed.broadcast(tensor,
-                                                         src=self.ranks[src],
-                                                         group=metadata_group,
-                                                         async_op=True)
+                    handle = rdma_ops.broadcast(tensor, src=self.ranks[src], group=metadata_group, async_op=True)
                 else:
                     # use group for GPU tensors
-                    handle = torch.distributed.broadcast(tensor, src=self.ranks[src], group=group, async_op=True)
+                    handle = rdma_ops.broadcast(tensor, src=self.ranks[src], group=group, async_op=True)
                 async_handles.append(handle)
             for async_handle in async_handles:
                 async_handle.wait()
@@ -497,13 +494,10 @@ class GroupCoordinator:
                         continue
                     if tensor.is_cpu:
                         # use metadata_group for CPU tensors
-                        handle = torch.distributed.broadcast(tensor,
-                                                             src=self.ranks[src],
-                                                             group=metadata_group,
-                                                             async_op=True)
+                        handle = rdma_ops.broadcast(tensor, src=self.ranks[src], group=metadata_group, async_op=True)
                     else:
                         # use group for GPU tensors
-                        handle = torch.distributed.broadcast(tensor, src=self.ranks[src], group=group, async_op=True)
+                        handle = rdma_ops.broadcast(tensor, src=self.ranks[src], group=group, async_op=True)
                     async_handles.append(handle)
                     tensor_dict[key] = tensor
                 else:
@@ -732,9 +726,9 @@ def init_distributed_environment(
 ):
     # Determine the appropriate backend based on the platform
     from fastvideo.platforms import current_platform
-    backend = "nccl"
+    backend = "gloo"
     if current_platform.is_cuda_alike():
-        logger.info("Using nccl backend for CUDA platform")
+        logger.info("Using Gloo control groups and RDMA CUDA payloads")
     elif current_platform.is_npu():
         backend = "hccl"
         logger.info("Using hccl backend for NPU platform")

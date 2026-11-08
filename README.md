@@ -204,3 +204,19 @@ If you find FastVideo useful, please consider citing our research work:
   year={2025}
 }
 ```
+
+## Sol-H3-Spark RDMA integration
+
+The `h3-spark-unified` branch supports the Sol demo's four-rank H3 pipeline.
+`SPARK_CP_H3_PIPELINE_UNEVEN=1` permits balanced head groups when equal group
+sizes would reject the configured pipeline. The VSA implementation can supply
+`pipeline_io` to fuse layout conversion with transport input and output.
+
+The distributed runtime uses Gloo control groups and the external
+`ulysses_head_pipeline.collective_ops` adapter for CUDA payloads. This branch
+requires that source package on `PYTHONPATH`, including its four-rank `mesh`,
+`h3_schedule`, and `collective_ops` modules. It is supplied by the Sol deployment;
+there is no pip requirement or submodule pin in this repository. A standalone
+checkout without that package cannot load the modified distributed runtime.
+See the Sol-H3-Spark README in the matching Sana checkout for the dependency,
+RDMA device access, exactness checks, and configuration contract.

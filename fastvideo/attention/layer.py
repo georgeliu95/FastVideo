@@ -3,7 +3,7 @@
 import os
 import weakref
 from functools import wraps
-from typing import Optional
+from typing import TypedDict
 
 import torch
 import torch.nn as nn
@@ -201,6 +201,7 @@ class DistributedAttention(nn.Module):
 # exchange, bit for bit: only meaningful when the attention's bits per head do not depend on the group size (VSA-H3
 # on GB10 needs Sol-H3-Spark's exact mode, SPARK_CP_H3_PIPELINE_EXACT=1).
 _H3_PIPELINE_GROUPS = int(os.environ.get("SPARK_CP_H3_PIPELINE_GROUPS", "1"))
+_H3_PIPELINE_UNEVEN = os.environ.get("SPARK_CP_H3_PIPELINE_UNEVEN", "0") == "1"
 _H3_PIPELINE_LAYERS: list[weakref.ref] = []
 
 
@@ -209,7 +210,7 @@ def _vsa_head_group_pipeline(
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        gate: Optional[torch.Tensor],  # noqa: UP045 -- the custom-op schema spelling
+        gate: torch.Tensor | None,  # noqa: UP045 -- the custom-op schema spelling
         layer: torch.Tensor,
         original_seq_len: int) -> torch.Tensor:
     """Opaque to the regional fullgraph compile: the pipeline orders streams and calls the attention per group.
@@ -223,6 +224,15 @@ def _vsa_head_group_pipeline_fake(q, k, v, gate, layer, original_seq_len):
     return q.new_empty((*q.shape[:-1], v.shape[-1]))
 
 
+class _PipelineStats(TypedDict):
+    calls: int
+    attention_calls: int
+    checks: int
+    groups: int
+    group_sizes: tuple[int, ...] | None
+    transport: str | None
+
+
 class DistributedAttention_VSA(DistributedAttention):
     """Distributed attention layer with VSA support.
     """
@@ -232,7 +242,14 @@ class DistributedAttention_VSA(DistributedAttention):
     # e.g. ulysses_head_pipeline.spark_rdma.factory(...) (RDMA from host-pinned buffers on DGX Spark).
     pipeline_transport_factory = None
     # Process-wide: pipelined forwards, inner attention calls they made (G each, plus one per check) and checks.
-    pipeline_stats = {"calls": 0, "attention_calls": 0, "checks": 0, "groups": _H3_PIPELINE_GROUPS, "transport": None}
+    pipeline_stats: _PipelineStats = {
+        "calls": 0,
+        "attention_calls": 0,
+        "checks": 0,
+        "groups": _H3_PIPELINE_GROUPS,
+        "group_sizes": None,
+        "transport": None
+    }
     _pipeline = None  # ulysses_head_pipeline.HeadGroupPipeline, made at the first pipelined call
 
     def __init__(self, *args, **kwargs) -> None:
@@ -246,8 +263,12 @@ class DistributedAttention_VSA(DistributedAttention):
         cls = DistributedAttention_VSA
         if cls._pipeline is None:
             from ulysses_head_pipeline import HeadGroupPipeline
+            schedule: int | tuple[int, ...] = _H3_PIPELINE_GROUPS
+            if _H3_PIPELINE_UNEVEN:
+                from ulysses_head_pipeline.h3_schedule import balanced_head_schedule
+                schedule = balanced_head_schedule(q.shape[2] // get_sp_world_size(), _H3_PIPELINE_GROUPS)
             cls._pipeline = HeadGroupPipeline(get_sp_group().device_group,
-                                              _H3_PIPELINE_GROUPS,
+                                              schedule,
                                               cls.pipeline_transport_factory,
                                               name="h3 pipeline")
         ctx_attn_metadata = get_forward_context().attn_metadata
@@ -260,10 +281,17 @@ class DistributedAttention_VSA(DistributedAttention):
             output = impl.forward(parts[0], parts[1], parts[2], gate, ctx_attn_metadata)  # type: ignore[call-arg]
             return impl.postprocess_output(output, ctx_attn_metadata)
 
-        result = cls._pipeline.run(xs, attention, original_seq_len)  # fresh [1, t, heads, d]
+        fusion = getattr(impl, "pipeline_io", None)
+        if fusion is None:
+            result = cls._pipeline.run(xs, attention, original_seq_len)
+        else:
+            result = fusion.run(cls._pipeline, xs, ctx_attn_metadata)
         stats = cls.pipeline_stats
         stats["calls"] += 1
-        stats["attention_calls"] += _H3_PIPELINE_GROUPS
+        sizes = cls._pipeline.sizes(q.shape[2])
+        stats["groups"] = len(sizes)
+        stats["group_sizes"] = sizes
+        stats["attention_calls"] += len(sizes)
         stats["transport"] = cls._pipeline.describe()
         if self._pipeline_checks > 0:
             self._pipeline_checks -= 1
@@ -319,8 +347,10 @@ class DistributedAttention_VSA(DistributedAttention):
 
         batch_size, seq_len, num_heads, head_dim = q.shape
         if (_H3_PIPELINE_GROUPS > 1 and get_sp_world_size() > 1 and batch_size == 1 and freqs_cis is None
-                and num_heads % (get_sp_world_size() * _H3_PIPELINE_GROUPS) == 0 and k.shape == q.shape
-                and v.shape == q.shape and (gate_compress is None or gate_compress.shape == q.shape)):
+                and num_heads % get_sp_world_size() == 0
+                and (_H3_PIPELINE_UNEVEN or num_heads % (get_sp_world_size() * _H3_PIPELINE_GROUPS) == 0)
+                and k.shape == q.shape and v.shape == q.shape
+                and (gate_compress is None or gate_compress.shape == q.shape)):
             output = _vsa_head_group_pipeline(q, k, v, gate_compress, self._pipeline_index, original_seq_len)
             return output, None
         return self._exchange_attention(q, k, v, gate_compress, original_seq_len, freqs_cis, ctx_attn_metadata), None

@@ -1,3 +1,4 @@
+from ulysses_head_pipeline import collective_ops as rdma_ops
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/device_communicators/base_device_communicator.py
 
@@ -29,13 +30,13 @@ class DistributedAutograd:
             ctx.group = group
             ctx.op = op
             output = input_.clone()
-            dist.all_reduce(output, group=group, op=op)
+            rdma_ops.all_reduce(output, group=group, op=op)
             return output
 
         @staticmethod
         def backward(ctx: Any, grad_output: Tensor) -> tuple[None, Tensor, None]:
             grad_output = grad_output.clone()
-            dist.all_reduce(grad_output, group=ctx.group, op=ctx.op)
+            rdma_ops.all_reduce(grad_output, group=ctx.group, op=ctx.op)
             return None, grad_output, None
 
     class AllGather(torch.autograd.Function):
@@ -59,7 +60,7 @@ class DistributedAutograd:
             output_size = (input_size[0] * world_size, ) + input_size[1:]
             output_tensor = torch.empty(output_size, dtype=input_.dtype, device=input_.device)
 
-            dist.all_gather_into_tensor(output_tensor, input_, group=group)
+            rdma_ops.all_gather_into_tensor(output_tensor, input_, group=group)
 
             output_tensor = output_tensor.reshape((world_size, ) + input_size)
             output_tensor = output_tensor.movedim(0, dim)
@@ -114,7 +115,7 @@ class DistributedAutograd:
             shard_size = grad_output.shape[0]
             grad_input_shape = (shard_size * ctx.world_size, ) + tuple(grad_output.shape[1:])
             grad_input = torch.empty(grad_input_shape, dtype=grad_output.dtype, device=grad_output.device)
-            dist.all_gather_into_tensor(grad_input, grad_output, group=ctx.group)
+            rdma_ops.all_gather_into_tensor(grad_input, grad_output, group=ctx.group)
             if ctx.scale_grad:
                 grad_input = grad_input / ctx.world_size
 
@@ -152,7 +153,7 @@ class DistributedAutograd:
                 input_ = input_.transpose(0, 2).contiguous()  # hn, shard_seqlen, bs, hd
                 output = torch.empty_like(input_)
 
-                dist.all_to_all_single(output, input_, group=group)  # hn, shard_seqlen, bs, hd
+                rdma_ops.all_to_all_single(output, input_, group=group)  # hn, shard_seqlen, bs, hd
 
                 output = torch.cat(output.split(shard_hn), dim=1)  # sharded hn, seqlen, bs, hd
 
@@ -172,7 +173,7 @@ class DistributedAutograd:
 
                 output = torch.empty_like(input_)
 
-                dist.all_to_all_single(output, input_, group=group)
+                rdma_ops.all_to_all_single(output, input_, group=group)
 
                 output = output.transpose(0, 2).contiguous()  # bs, seqlen, sharded_hn, hd
 
